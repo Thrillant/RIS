@@ -1,0 +1,30 @@
+%% SVD-based precoding (truncated SVD) -----
+
+% Compute economy SVD of H (H is numUE x M)
+[U_svd, S_svd, V_svd] = svd(H, 'econ');      % U_svd: numUE x r, S_svd: r x r, V_svd: M x r
+singular_vals = diag(S_svd);
+
+% Tolerance for truncation (relative to largest singular value)
+tol_rel = 1e-3;                              % you can tweak this (e.g., 1e-2 .. 1e-4)
+r = sum(singular_vals > tol_rel * singular_vals(1));
+if r == 0
+    r = 1; % ensure at least one singular vector kept
+end
+
+% Truncated inverse of S
+S_inv_trunc = diag(1 ./ singular_vals(1:r));
+
+% Build precoder W (size: M x numUE) using truncated SVD pseudoinverse
+W_svd = V_svd(:,1:r) * S_inv_trunc * U_svd(:,1:r)';
+
+% Optional: normalize W to satisfy transmit power scaling similar to pinv(H)
+% (so transmit power per symbol remains comparable to the ZF case)
+% Compute normalization factor so that average column power matches pinv(H)
+W_zf = pinv(H);
+colPow_zf = mean(sum(abs(W_zf).^2,1));      % average Frobenius power per column (scalar)
+colPow_svd = mean(sum(abs(W_svd).^2,1));
+if colPow_svd > 0
+    W = W_svd * sqrt(colPow_zf / colPow_svd);
+else
+    W = W_svd;
+end
