@@ -1,0 +1,192 @@
+clear; clc;
+%% System Parameters
+fc = 28e9;
+c = physconst('Lightspeed');
+lambda = c / fc;
+fs = 10e6;
+numSymbols = 1000;
+rng(2023);
+
+%% Channel/pathloss parameters
+beta0_dB = -20;            % Reference pathloss β0^2 at d0=1m in dB
+beta0 = 10^(beta0_dB/10);  % Linear scale
+d0 = 1;
+alphaG = 5;              % Path loss exponent BS-RIS
+alphaH1 = 5;               % Path loss exponent BS-UE
+alphaH2 = 5;               % Path loss exponent RIS-UE
+
+K_dB = 10;   % Rician K-factor
+K = 10^(K_dB / 10);
+kappa = sqrt(K/(K+1));
+
+%% Arrays and geometry
+Nr = 20; Nc = 20;                          % RIS: m x n (mn elements)
+dr = 0.5*lambda; dc = 0.5*lambda;        % Half-wavelength spacing
+numRIS = Nr*Nc;
+M = 4;                                   % #BS antennas
+bsPos = [0; 0; 30];                      % BS at (0,0,30)
+
+% User positions: 1000m from BS, heights , 1, 4, ..., 28m
+numUE = 10;
+ue_x = 5000;
+pos_ue = [ue_x*ones(1,numUE); zeros(1,numUE); [1 4 7 10 13 16 19 22 25 28]];
+
+% Sweep ranges for RIS position
+RIS_x_vals = 200:200:(ue_x-100);       % horizontal sweep (example)
+RIS_z_vals = 2:3:29;             % vertical sweep
+results_SNRs = zeros(length(RIS_z_vals), length(RIS_x_vals), numUE);
+
+%% Choose fading type per link (set manually)
+% Options: 'rh' = Rayleigh, 'rn' = Rician
+type_h1 = 'rh';   % BS -> UE
+type_h2 = 'rh';   % RIS -> UE
+type_G  = 'rh';   % BS -> RIS
+
+%% Loop over RIS_x and RIS_z
+for ix = 1:length(RIS_x_vals)
+    for iz = 1:length(RIS_z_vals)
+        % Place RIS at (x,0,z)
+        pos_ris = [RIS_x_vals(ix); 0; RIS_z_vals(iz)];
+        rowIndices = (-(Nr-1)/2:(Nr-1)/2)*dr;
+        colIndices = (-(Nc-1)/2:(Nc-1)/2)*dc;
+        [Y, Z] = meshgrid(rowIndices, colIndices);
+        risElementPos = [pos_ris(1) * ones(1, numRIS); ...
+                         reshape(Y,1,[]); ...
+                         reshape(Z + pos_ris(3),1,[])];
+
+        % Channel arrays (per user)
+        H = zeros(numUE, M);
+        for k = 1:numUE
+            uePos = pos_ue(:,k);
+
+            %% h1: BS→UE
+            d_bs_ue = norm(bsPos - uePos);
+            beta_h1 = sqrt(beta0) * (d_bs_ue/d0)^(-alphaH1/2);
+            if strcmp(type_h1,'rh')
+                g1 = (randn(M,1) + 1j*randn(M,1))/sqrt(2);
+                h1 = beta_h1 * g1;
+            else
+                LoS_h1 = ones(M,1);
+                NLoS_h1 = (randn(M,1)+1j*randn(M,1))/sqrt(2);
+                h1 = beta_h1*(kappa*LoS_h1 + sqrt(1-kappa^2)*NLoS_h1);
+            end
+
+            %% h2: RIS→UE
+            d_ris_ue = sqrt(sum((risElementPos - uePos).^2,1));
+            beta_h2 = sqrt(beta0) * (d_ris_ue/d0).^(-alphaH2/2);
+            if strcmp(type_h2,'rh')
+                g2 = (randn(1,numRIS) + 1j*randn(1,numRIS))/sqrt(2);
+                h2 = beta_h2 .* g2;
+            else
+                LoS_h2 = ones(1,numRIS);
+                NLoS_h2 = (randn(1,numRIS)+1j*randn(1,numRIS))/sqrt(2);
+                h2 = beta_h2 .* (kappa*LoS_h2 + sqrt(1-kappa^2)*NLoS_h2);
+            end
+
+            %% G: BS→RIS
+            d_bs_ris = sqrt(sum((risElementPos - bsPos).^2,1));
+            beta_G = sqrt(beta0) * (d_bs_ris/d0).^(-alphaG/2);
+            if strcmp(type_G,'rh')
+                G_NLoS = (randn(numRIS,M) + 1j*randn(numRIS,M))/sqrt(2);
+                G = diag(beta_G) * G_NLoS;
+            else
+                G_LoS = ones(numRIS,M);
+                G_NLoS = (randn(numRIS,M)+1j*randn(numRIS,M))/sqrt(2);
+                G = diag(beta_G) * (kappa*G_LoS + sqrt(1-kappa^2)*G_NLoS);
+            end
+
+            %% Effective channel for user k
+            c = h2.' + G * h1;    % N x 1
+            H(k,:) = (sum(c)/sqrt(numRIS)) * ones(1,M);
+        end
+
+        %% Zero-forcing precoding (multiuser)
+        W = pinv(H);
+        
+        %% Transmit power and noise
+        Ptx = 0.5;
+        data = 2*randi([0 1], numSymbols, numUE) - 1;
+        x_precoded = sqrt(Ptx) * data * W.';
+        y = H * x_precoded.'; y = y.';
+        noisePower = 0.01;
+        noise = sqrt(noisePower/2)*(randn(size(y))+1j*randn(size(y)));
+        y_noisy = y + noise;
+
+        %% Store and print SNR per user while varying both RIS height and width
+        for k = 1:numUE
+            sig_p = bandpower(y(:,k));
+            noise_p = bandpower(noise(:,k));
+            SNR = 10*log10(sig_p / noise_p);
+        
+            % Store
+            results_SNRs(iz,ix,k) = SNR;
+
+            % Print
+            fprintf('RIS x=%.0f m, z=%.0f m | UE%d (h=%.1f): SNR = %.2f dB\n', ...
+                RIS_x_vals(ix), RIS_z_vals(iz), k, pos_ue(3,k), SNR);
+        end
+    end
+end
+
+type_H1 = '';
+type_H2 = '';
+type_G1 = '';
+
+if strcmp(type_h1, 'rh')
+    type_H1 = 'Rayleigh';
+else
+    type_H1 = 'Rician';
+end
+if strcmp(type_h2, 'rh')
+    type_H2 = 'Rayleigh';
+else
+    type_H2 = 'Rician';
+end
+if strcmp(type_G, 'rh')
+    type_G1 = 'Rayleigh';
+else
+    type_G1 = 'Rician';
+end
+
+filename = 'RIS_Data_RH_RH_RH.csv';
+data = [];
+
+for k = 1:numUE
+    for ix = 1:length(RIS_x_vals)
+        for iz = 1:length(RIS_z_vals)
+            % Extract SNR
+            SNR = results_SNRs(iz,ix,k);
+
+            % Append row: channels + geometry + result
+            data = [data; ...
+                {Nr, Nc, alphaH1, alphaH2, alphaG, ...
+                 pos_ue(1,k), pos_ue(3,k), RIS_x_vals(ix), RIS_z_vals(iz), SNR}];
+        end
+    end
+end
+
+% Convert to table with proper column names
+T = cell2table(data, 'VariableNames', ...
+    {'Nr', 'Nc', 'alphaH1','alphaH2','alphaG', ...
+     'UE_X_m','UE_Z_m','RIS_X_m','RIS_Z_m','SNR_dB'});
+
+% Write to Excel
+if isfile(filename)
+    writetable(T, filename, 'WriteMode','append', 'WriteVariableNames', false);
+else
+    writetable(T, filename);
+end
+
+
+%% Plot heatmap for each UE
+figure;
+for k = 1:numUE
+    subplot(2,5,k); % 2 rows, 5 columns
+    imagesc(RIS_x_vals, RIS_z_vals, results_SNRs(:,:,k));
+    set(gca,'YDir','normal');
+    colorbar;
+    xlabel('RIS x (m)');
+    ylabel('RIS z (m)');
+    title(sprintf('UE%d (h=%.1f m)', k, pos_ue(3,k)));
+end
+sgtitle(sprintf('SNR Heatmaps per UE (h1=%s, h2=%s, G=%s)',type_h1,type_h2,type_G));
